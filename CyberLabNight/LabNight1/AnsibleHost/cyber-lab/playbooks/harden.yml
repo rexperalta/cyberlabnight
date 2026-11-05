@@ -1,0 +1,245 @@
+---
+# Cyber Lab Night - RHEL 10 DISA STIG hardening
+# Run from /opt/cyber-lab:  ansible-playbook playbooks/harden.yml
+# No reboot, no package installs, nothing that can lock Ansible out.
+
+- name: Harden RHEL 10 target against selected DISA STIG controls
+  hosts: target
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    # ================= CAT I (high) =================
+
+    - name: "CAT I | Disable the Ctrl-Alt-Del reboot key sequence"
+      ansible.builtin.systemd_service:
+        name: ctrl-alt-del.target
+        masked: true
+
+    - name: "CAT I | Create systemd drop-in folder"
+      ansible.builtin.file:
+        path: /etc/systemd/system.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: "CAT I | Ignore repeated Ctrl-Alt-Del presses (burst action)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system.conf.d/50-ctrlaltdel.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Manager]
+          CtrlAltDelBurstAction=none
+      notify: Reexec systemd
+
+    - name: "CAT I | Check authselect profile (for blank-password fix)"
+      ansible.builtin.command: authselect current
+      register: authselect_current
+      changed_when: false
+      failed_when: false
+
+    - name: "CAT I | Do not allow blank or null passwords (remove nullok)"
+      ansible.builtin.command: authselect enable-feature without-nullok
+      when:
+        - authselect_current.rc == 0
+        - "'without-nullok' not in authselect_current.stdout"
+
+    - name: "CAT I | Verify package signatures (dnf gpgcheck)"
+      ansible.builtin.lineinfile:
+        path: /etc/dnf/dnf.conf
+        regexp: '^\s*gpgcheck\s*='
+        line: "gpgcheck=1"
+        insertafter: '^\[main\]'
+
+    # ================= SSH daemon =================
+
+    - name: "SSH | STIG settings drop-in"
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-complianceascode-hardening.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Cyber Lab Night harden.yml
+          PermitEmptyPasswords no
+          PermitRootLogin no
+          PermitUserEnvironment no
+          X11Forwarding no
+          IgnoreRhosts yes
+          IgnoreUserKnownHosts yes
+          HostbasedAuthentication no
+          GSSAPIAuthentication no
+          KerberosAuthentication no
+          StrictModes yes
+          PrintLastLog yes
+          LogLevel VERBOSE
+          ClientAliveInterval 600
+          ClientAliveCountMax 1
+          Banner /etc/issue
+      notify:
+        - Validate sshd config
+        - Reload sshd
+
+    - name: "SSH | DoD notice and consent banner"
+      ansible.builtin.copy:
+        dest: /etc/issue
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          You are accessing a U.S. Government (USG) Information System (IS) that is provided for USG-authorized use only. By using this IS (which includes any device attached to this IS), you consent to the following conditions:
+          -The USG routinely intercepts and monitors communications on this IS for purposes including, but not limited to, penetration testing, COMSEC monitoring, network operations and defense, personnel misconduct (PM), law enforcement (LE), and counterintelligence (CI) investigations.
+          -At any time, the USG may inspect and seize data stored on this IS.
+          -Communications using, or data stored on, this IS are subject to routine monitoring, interception, and search, and may be disclosed or used for any USG-authorized purpose.
+          -This IS includes security measures (e.g., authentication and access controls) to protect USG interests--not for your personal benefit or privacy.
+          -Notwithstanding the above, using this IS does not constitute consent to PM, LE or CI investigative searching or monitoring of the content of privileged communications, or work product, related to personal representation or services by attorneys, psychotherapists, or clergy, and their assistants. Such communications and work product are private and confidential. See User Agreement for details.
+
+    # ================= Accounts and passwords =================
+
+    - name: "Accounts | Login defaults in /etc/login.defs"
+      ansible.builtin.lineinfile:
+        path: /etc/login.defs
+        regexp: '^#?\s*{{ item.key }}\s'
+        line: "{{ item.key }}   {{ item.value }}"
+      loop:
+        - { key: PASS_MAX_DAYS, value: "60" }
+        - { key: PASS_MIN_DAYS, value: "1" }
+        - { key: UMASK,         value: "077" }
+
+    - name: "Accounts | Password complexity in /etc/security/pwquality.conf"
+      ansible.builtin.lineinfile:
+        path: /etc/security/pwquality.conf
+        regexp: '^#?\s*{{ item.key }}\s*='
+        line: "{{ item.key }} = {{ item.value }}"
+      loop:
+        - { key: minlen,  value: "15" }
+        - { key: dcredit, value: "-1" }
+        - { key: ucredit, value: "-1" }
+        - { key: lcredit, value: "-1" }
+        - { key: ocredit, value: "-1" }
+        - { key: difok,   value: "8" }
+
+    - name: "Accounts | Close idle shell sessions after 15 minutes"
+      ansible.builtin.copy:
+        dest: /etc/profile.d/tmout.sh
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          declare -xr TMOUT=900
+
+    # ================= Kernel =================
+
+    - name: "Kernel | STIG sysctl settings"
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-cyber-lab-stig.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          kernel.dmesg_restrict = 1
+          kernel.kptr_restrict = 1
+          kernel.yama.ptrace_scope = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.send_redirects = 0
+          net.ipv6.conf.all.accept_ra = 0
+          net.ipv6.conf.default.accept_ra = 0
+      notify: Apply sysctl settings
+
+    - name: "Kernel | Disable unneeded kernel modules"
+      ansible.builtin.copy:
+        dest: "/etc/modprobe.d/{{ item }}.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          install {{ item }} /bin/false
+          blacklist {{ item }}
+      loop:
+        - usb-storage
+        - cramfs
+        - atm
+        - can
+        - sctp
+        - tipc
+
+    # ================= Services and core dumps =================
+
+    - name: "Services | Mask debug shell and core dump socket"
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        masked: true
+      loop:
+        - debug-shell.service
+        - systemd-coredump.socket
+
+    - name: "Core dumps | Create coredump drop-in folder"
+      ansible.builtin.file:
+        path: /etc/systemd/coredump.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: "Core dumps | Do not store or process core dumps"
+      ansible.builtin.copy:
+        dest: /etc/systemd/coredump.conf.d/50-stig.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Coredump]
+          Storage=none
+          ProcessSizeMax=0
+
+    - name: "Core dumps | Hard limit of zero for all users"
+      ansible.builtin.copy:
+        dest: /etc/security/limits.d/50-coredump.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          *     hard   core   0
+
+  handlers:
+    - name: Validate sshd config
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+
+    - name: Reload sshd
+      ansible.builtin.systemd_service:
+        name: sshd
+        state: reloaded
+
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Reexec systemd
+      ansible.builtin.systemd_service:
+        daemon_reexec: true
+
+## ---------------------------------------------------------------
+## CHALLENGE: The vendor install added an insecure service.
+## 1. Find the CAT I failure in your latest scan report.
+## 2. Remove the "# " (hash and space) from each line below.
+## 3. Put the package name after the dash.
+## 4. Check your work:  ansible-playbook playbooks/harden.yml --syntax-check
+## 5. Run it, then rescan.
+## Lines starting with ## are hints. Leave them.
+## ---------------------------------------------------------------
+- name: Remove insecure network services
+  hosts: target
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: "CAT I | Remove the insecure package your scan found"
+      ansible.builtin.dnf:
+        name:
+          - vsftpd 
+          - tftp-server
+          - telnet-server
+        state: absent

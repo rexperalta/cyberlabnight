@@ -1,0 +1,64 @@
+---
+# Cyber Lab Night - run an OpenSCAP STIG scan on the target
+# and copy the results back to the Ansible box.
+#
+# Usage (from /opt/cyber-lab):
+#   ansible-playbook playbooks/scan.yml -e phase=before
+#   ansible-playbook playbooks/scan.yml -e phase=after
+
+- name: Scan target with OpenSCAP and collect results
+  hosts: target
+  become: true
+  gather_facts: false
+
+  vars:
+    phase: before
+    content: /usr/share/xml/scap/ssg/content/ssg-rhel10-ds.xml
+    profile: xccdf_org.ssgproject.content_profile_stig
+    remote_dir: /var/tmp/cyber-lab-scan
+    local_dir: "/opt/cyber-lab/results/{{ inventory_hostname }}"
+
+  tasks:
+    - name: Check phase is before or after
+      ansible.builtin.assert:
+        that: phase in ['before', 'after']
+        fail_msg: "Use -e phase=before or -e phase=after"
+
+    - name: Create scan folder on target
+      ansible.builtin.file:
+        path: "{{ remote_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Run OpenSCAP STIG scan (takes a few minutes)
+      ansible.builtin.command: >
+        oscap xccdf eval
+        --profile {{ profile }}
+        --results {{ remote_dir }}/{{ phase }}-results.xml
+        --report {{ remote_dir }}/{{ phase }}-report.html
+        --stig-viewer {{ remote_dir }}/{{ phase }}-stigviewer.xml
+        {{ content }}
+      register: scan
+      async: 1800
+      poll: 15
+      changed_when: false
+      # oscap exit codes: 0 = all passed, 2 = some rules failed (normal), 1 = error
+      failed_when: scan.rc not in [0, 2]
+
+    - name: Copy results to the Ansible box
+      ansible.builtin.fetch:
+        src: "{{ remote_dir }}/{{ item }}"
+        dest: "{{ local_dir }}/{{ item }}"
+        flat: true
+      loop:
+        - "{{ phase }}-results.xml"
+        - "{{ phase }}-report.html"
+        - "{{ phase }}-stigviewer.xml"
+
+    - name: Show summary
+      ansible.builtin.debug:
+        msg:
+          - "Phase:  {{ phase }}"
+          - "Passed: {{ scan.stdout | regex_findall('Result\\s+pass') | length }}"
+          - "Failed: {{ scan.stdout | regex_findall('Result\\s+fail') | length }}"
+          - "Saved:  {{ local_dir }}/{{ phase }}-report.html"
